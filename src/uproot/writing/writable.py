@@ -38,6 +38,7 @@ import uproot.model
 import uproot.models.TObjString
 import uproot.sink.file
 import uproot.writing._cascade
+import uproot.writing._cascadentuple
 import uproot.writing._cascadetree
 import uproot.writing.identify
 from uproot._util import no_filter, no_rename
@@ -520,9 +521,11 @@ class WritableDirectory(MutableMapping):
     Subdirectories created this way will never be empty; to make an empty directory,
     use :ref:`uproot.writing.writable.WritableDirectory.mkdir`.
 
-    Similarly, non-empty TTrees can be created by assignment (see :doc:`uproot.writing.writable.WritableTree`
-    for recognized TTree-like data), but empty TTrees require the
-    :ref:`uproot.writing.writable.WritableDirectory.mktree` method.
+    Similarly, non-empty RNTuples can be created by assignment starting in Uproot
+    v5.7.0 (see :doc:`uproot.writing.writable.WritableNTuple` for recognized
+    RNTuple-like data), but empty RNTuples require the
+    :ref:`uproot.writing.writable.WritableDirectory.mkrntuple` method.
+    Writing a TTree requires the :ref:`uproot.writing.writable.WritableDirectory.mktree` method.
     """
 
     def __init__(self, path, file, cascading):
@@ -1236,6 +1239,7 @@ class WritableDirectory(MutableMapping):
                     self._file.uuid_function(),
                 ),
             )
+            self._subdirs[head] = directory
 
         elif key.classname.string not in ("TDirectory", "TDirectoryFile"):
             raise TypeError(
@@ -1283,15 +1287,9 @@ in file {self.file_path} in directory {self.path}"""
 
         Creates an empty TTree in this directory.
 
-        Note that TTrees can be created by assigning TTree-like data to a directory
-        (see :doc:`uproot.writing.writable.WritableTree` for recognized TTree-like types):
-
-        .. code-block:: python
-
-            my_directory["tree"] = {"branch1": np.array(...), "branch2": ak.Array(...)}
-
-        but TTrees created this way will never be empty. Use this method
-        to make an empty TTree or to control its parameters.
+        Note that starting in v5.7.0, Uproot uses RNTuples as the default format for writing
+        data when using the dict-like assignment syntax. Writing a TTree requires using this
+        method.
         """
         if self._file.sink.closed:
             raise ValueError("cannot create a TTree in a closed file")
@@ -1386,6 +1384,16 @@ in file {self.file_path} in directory {self.path}"""
             description (str): Description for the new RNTuple.
 
         Creates an empty RNTuple in this directory.
+
+        Note that starting in v5.7.0, non-empty RNTuples can be created by
+        assigning RNTuple-like data to a directory:
+
+        .. code-block:: python
+
+            my_directory["ntuple"] = {"field1": np.array(...), "field2": ak.Array(...)}
+
+        but RNTuples created this way will never be empty. Use this method
+        to make an empty RNTuple or to control its parameters.
         """
         if self._file.sink.closed:
             raise ValueError("cannot create a RNTuple in a closed file")
@@ -1394,19 +1402,35 @@ in file {self.file_path} in directory {self.path}"""
             ak_form = _type_specification_to_awkward_form(type_spec_or_data)
             return self.mkrntuple(name, ak_form, description)
 
-        type_spec_or_data = _regularize_input_type_to_awkward(type_spec_or_data)
+        type_spec_or_data = (
+            uproot.writing._cascadentuple._regularize_input_type_to_awkward(
+                type_spec_or_data
+            )
+        )
         if isinstance(type_spec_or_data, awkward.Array):
-            ntuple = self.mkrntuple(name, type_spec_or_data.layout.form, description)
+            form = type_spec_or_data.layout.form
+            packed_form = uproot.writing._cascadentuple._to_packed_form(form)
+            if not isinstance(packed_form, awkward.forms.RecordForm):
+                raise TypeError(
+                    f"Input Awkward array must be a RecordArray or reducible to such. Got array with form {form!r}."
+                )
+            ntuple = self.mkrntuple(name, packed_form, description)
             ntuple.extend(type_spec_or_data)
             return ntuple
-        if isinstance(
-            type_spec_or_data, (awkward.contents.Content, awkward.forms.Form)
-        ) and not isinstance(type_spec_or_data, awkward.forms.RecordForm):
-            raise TypeError("Awkward input must be a high-level array or a RecordForm")
-        elif not isinstance(type_spec_or_data, awkward.forms.RecordForm):
+        if isinstance(type_spec_or_data, awkward.forms.Form):
+            packed_form = uproot.writing._cascadentuple._to_packed_form(
+                type_spec_or_data
+            )
+            if not isinstance(packed_form, awkward.forms.RecordForm):
+                raise TypeError(
+                    f"Input Awkward form must be a RecordForm or reducible to such. Got {type_spec_or_data!r}."
+                )
+            type_spec_or_data = packed_form
+        else:
             raise TypeError(
-                "Input must be a type specification (in the form of an Awkward RecordForm, or a dict of str \u2192 NumPy dtype/Awkward type)"
-                "or data (in the form of a high-level Awkward record array, Pandas dataframe, or dict)"
+                "Input must be a type specification (in the form of an Awkward RecordForm, or a dict of str \u2192 NumPy dtype/Awkward type) "
+                "or data (in the form of a high-level Awkward record array, Pandas dataframe, or dict). "
+                f"Got {type(type_spec_or_data).__name__}."
             )
 
         # The rest assumes that type_spec_or_data is a RecordForm
@@ -1994,10 +2018,11 @@ class WritableNTuple:
 
     Represents a writable ``RNTuple`` from a ROOT file.
 
-    Assigning TTree-like data to a directory creates the TTree object with all of
-    its metadata and fills it with the contents of the arrays in one step. To separate
-    the process of creating the TTree metadata from filling the first TBasket, use the
-    :doc:`uproot.writing.writable.WritableDirectory.mktree` method:
+    Assigning data to a directory creates an RNTuple object by default starting in Uproot v5.7.0.
+    This creates the RNTuple object with all of its metadata and fills it with
+    the contents of the arrays in one step. To separate the process of creating the
+    RNTuple metadata from filling the first cluster, use the
+    :doc:`uproot.writing.writable.WritableDirectory.mkrntuple` method:
 
     .. code-block:: python
 
@@ -2021,8 +2046,8 @@ class WritableNTuple:
     and slow to read (especially for Uproot, but also for ROOT).
 
     For instance, if you want to write a million events and have enough memory
-    available to do that 100 thousand events at a time (total of 10 TBaskets),
-    then do so. Filling the RNTuple a hundred events at a time (total of 10000 TBaskets)
+    available to do that 100 thousand events at a time (total of 10 clusters),
+    then do so. Filling the RNTuple a hundred events at a time (total of 10000 clusters)
     would be considerably slower for writing and reading, and the file would be much
     larger than it could otherwise be, even with compression.
     """
@@ -2217,8 +2242,38 @@ def _is_type_specification(obj):
             else:
                 return False
         if not isinstance(
-            obj, (numpy.dtype, awkward.types.Type, awkward.types.ArrayType, str, type)
+            obj,
+            (
+                numpy.dtype,
+                awkward.types.Type,
+                awkward.types.ArrayType,
+                type,
+                str,
+                tuple,
+            ),
         ):
+            return False
+        # for tuples and strings we need to make sure they actually specify a type and are not just data
+        if isinstance(obj, tuple):
+            try:
+                numpy.dtype(obj)
+            except (TypeError, ValueError):
+                return False
+            else:
+                continue
+        if isinstance(obj, str):
+            try:
+                numpy.dtype(obj)
+            except (TypeError, ValueError):
+                pass
+            else:
+                continue
+            try:
+                awkward.types.from_datashape(obj, highlevel=False)
+            except Exception:
+                pass
+            else:
+                continue
             return False
     return True
 
@@ -2228,12 +2283,45 @@ def _type_specification_to_awkward_form(obj):
         return obj
     if isinstance(obj, (awkward.types.Type, awkward.types.ArrayType)):
         return awkward.forms.from_type(obj)
-    if isinstance(obj, (numpy.dtype, type)):
-        obj = str(numpy.dtype(obj))
+    if isinstance(obj, type):
+        obj = numpy.dtype(obj)
+        if obj == numpy.dtype("O"):
+            raise TypeError(f"Cannot construct a NumPy dtype from {obj!r}.")
+    if isinstance(obj, tuple):
+        try:
+            obj = numpy.dtype(obj)
+        except (TypeError, ValueError):
+            raise TypeError(
+                f"Cannot construct a NumPy dtype from the tuple {obj!r}."
+            ) from None
     if isinstance(obj, str):
-        return awkward.forms.from_type(
-            awkward.types.from_datashape(obj, highlevel=False)
-        )
+        # First we try to interpret the string as a NumPy dtype
+        # so we can try to convert it to a string Awkward understands
+        try:
+            dt = numpy.dtype(obj)
+        except (TypeError, ValueError):
+            pass
+        else:
+            obj = dt
+    if isinstance(obj, numpy.dtype):
+        obj = obj.newbyteorder("<")
+        if obj.subdtype is None:
+            field_shape = ()
+        else:
+            obj, field_shape = obj.subdtype
+        dims = ""
+        if len(field_shape) > 0:
+            dims = dims + "".join(str(x) + " * " for x in field_shape)
+        obj = f"{dims}{obj}"
+    if isinstance(obj, str):
+        try:
+            return awkward.forms.from_type(
+                awkward.types.from_datashape(obj, highlevel=False)
+            )
+        except Exception:
+            raise TypeError(
+                f"Cannot construct an Awkward Form from type specification {obj!r}"
+            ) from None
     if isinstance(obj, Mapping):
         return awkward.forms.RecordForm(
             [_type_specification_to_awkward_form(v) for v in obj.values()],
@@ -2241,7 +2329,7 @@ def _type_specification_to_awkward_form(obj):
         )
     raise TypeError(
         f"Cannot construct an Awkward Form from {type(obj).__name__}. "
-        f"Supported types: Form, Type, ArrayType, dtype, str, Mapping"
+        f"Supported types: Form, Type, ArrayType, dtype, Mapping, str, tuple."
     )
 
 
@@ -2262,33 +2350,6 @@ def _regularize_input_type_to_dict(obj):
 
     if isinstance(obj, numpy.ndarray) and obj.dtype.fields is not None:
         obj = uproot.writing._cascadetree.recarray_to_dict(obj)
-
-    return obj
-
-
-def _regularize_input_type_to_awkward(obj):
-    import awkward
-
-    if uproot._util.from_module(obj, "pandas"):
-        import pandas
-
-        if isinstance(
-            obj, pandas.DataFrame
-        ) and uproot._util.pandas_has_attr_is_numeric(pandas)(obj.index):
-            obj = uproot.writing._cascadetree.dataframe_to_dict(obj)
-            # Try to retype dtype=object columns
-            for k in obj.keys():
-                if obj[k].dtype == object:
-                    obj[k] = awkward.Array(obj[k].tolist())
-            obj = awkward.Array(obj)
-
-    elif isinstance(obj, numpy.ndarray) and obj.dtype.fields is not None:
-        obj = awkward.Array(obj)
-
-    elif isinstance(obj, dict):
-        # Sort dictionary keys to avoid issues
-        obj = {k: obj[k] for k in sorted(obj.keys())}
-        obj = awkward.Array(obj)
 
     return obj
 
